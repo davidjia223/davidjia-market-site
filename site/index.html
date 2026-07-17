@@ -1,0 +1,889 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Protective Put Simulator — davidjia.ca</title>
+<meta name="description" content="Portfolio insurance simulator: price protective puts on a $10,000 S&P 500 position with live end-of-day market data." />
+<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
+<script crossorigin src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+<script crossorigin src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; }
+  #root { min-height: 100vh; }
+  .boot { font: 14px/1.5 ui-monospace, Menlo, monospace; color: #4A5A6D; padding: 40px; }
+  input[type="range"] { -webkit-appearance: none; appearance: auto; }
+</style>
+</head>
+<body>
+<div id="root"><div class="boot">Loading market data…</div></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useMemo } = React;
+const {
+  ComposedChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
+  ReferenceLine, ResponsiveContainer, Legend,
+} = Recharts;
+
+/* ============================================================
+   DATA LAYER
+   Priority: freshest of  (a) ./data/market.json on this server
+                          (b) GitHub raw copy updated nightly by Actions
+   Fallback: bundled snapshot below (clearly labeled in the header).
+   To enable (b), replace the placeholders with your repo path.
+   ============================================================ */
+const GITHUB_RAW_DATA_URL =
+  "https://raw.githubusercontent.com/davidjia223/davidjia-market-site/main/site/data/market.json";
+
+const FALLBACK = {
+  asOf: "2026-07-14",
+  spy: { price: 751.83, history: null, source: "bundled" },
+  vix: { spot: 16.5, v9d: null, v3m: null, v6m: null },
+  rates: { tbill3m: 4.2, t10y: 4.59 },
+  divYield: 1.0,
+};
+
+const CAPITAL = 10000;
+let SPOT, VIX, RATE, DIV, AS_OF, HISTORY, TERM = null, DATA_NOTE = "";
+
+/* ---------- Black-Scholes machinery ---------- */
+function normCdf(x) {
+  const t = 1 / (1 + 0.2316419 * Math.abs(x));
+  const d = 0.3989423 * Math.exp((-x * x) / 2);
+  const p =
+    d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
+  return x > 0 ? 1 - p : p;
+}
+
+function putPrice(S, K, T, sigma, r = RATE, q = DIV) {
+  if (T <= 0) return Math.max(K - S, 0);
+  const sq = sigma * Math.sqrt(T);
+  const d1 = (Math.log(S / K) + (r - q + (sigma * sigma) / 2) * T) / sq;
+  const d2 = d1 - sq;
+  return K * Math.exp(-r * T) * normCdf(-d2) - S * Math.exp(-q * T) * normCdf(-d1);
+}
+
+/* Base ATM vol for maturity T: real CBOE term structure (VIX9D/VIX/VIX3M/VIX6M)
+   interpolated when available; otherwise VIX + mild contango model. */
+function termBase(Tyears) {
+  if (!TERM || TERM.length < 2) return VIX + 0.015 * Math.sqrt(Tyears);
+  if (Tyears <= TERM[0][0]) return TERM[0][1];
+  for (let i = 1; i < TERM.length; i++) {
+    if (Tyears <= TERM[i][0]) {
+      const [t0, v0] = TERM[i - 1];
+      const [t1, v1] = TERM[i];
+      return v0 + ((v1 - v0) * (Tyears - t0)) / (t1 - t0);
+    }
+  }
+  const [tL, vL] = TERM[TERM.length - 1];
+  return vL + 0.01 * (Math.sqrt(Tyears) - Math.sqrt(tL));
+}
+
+/* Implied vol: term-structure base + OTM put skew (steepest short-dated). */
+function impliedVol(Tyears, otmPct, baseVol) {
+  const base =
+    baseVol !== undefined ? baseVol + 0.015 * Math.sqrt(Tyears) : termBase(Tyears);
+  const months = Math.max(Tyears * 12, 0.25);
+  const skew = otmPct * (0.75 / Math.sqrt(months));
+  return Math.min(base + skew, 0.9);
+}
+
+function crashVol(Tyears, dropPct) {
+  return Math.min(impliedVol(Tyears, 0) + dropPct * 1.3, 0.6);
+}
+
+/* ---------- fallback pseudo-history (only if live data fails) ---------- */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function buildHistory(days) {
+  const rnd = mulberry32(20260714);
+  const raw = [1];
+  for (let i = 1; i < days; i++) {
+    const shock = (rnd() + rnd() + rnd() - 1.5) * 2;
+    const dip = i > days * 0.35 && i < days * 0.42 ? -0.0035 : 0;
+    raw.push(raw[i - 1] * (1 + 0.00045 + dip + shock * 0.0085));
+  }
+  const scale = SPOT / raw[raw.length - 1];
+  return raw.map((v) => v * scale);
+}
+
+function applyData(d, srcLabel) {
+  SPOT = d.spy.price;
+  VIX = (d.vix && d.vix.spot ? d.vix.spot : 16.5) / 100;
+  RATE = (d.rates && d.rates.tbill3m != null ? d.rates.tbill3m : 4.2) / 100;
+  DIV = (d.divYield != null ? d.divYield : 1.0) / 100;
+  AS_OF = d.asOf || "unknown";
+  HISTORY =
+    d.spy.history && d.spy.history.length > 30
+      ? d.spy.history.slice(-252).map((row) => row[1])
+      : buildHistory(252);
+  const pts = [];
+  if (d.vix) {
+    if (d.vix.v9d) pts.push([9 / 365, d.vix.v9d / 100]);
+    if (d.vix.spot) pts.push([30 / 365, d.vix.spot / 100]);
+    if (d.vix.v3m) pts.push([91 / 365, d.vix.v3m / 100]);
+    if (d.vix.v6m) pts.push([182 / 365, d.vix.v6m / 100]);
+  }
+  TERM = pts.length >= 2 ? pts : null;
+  DATA_NOTE = srcLabel + (TERM ? " · real vol term structure" : " · modeled term structure");
+}
+
+/* ============================================================
+   CRASH TIME MACHINE — five real S&P 500 episodes.
+   Stylized reconstructions from public index data:
+   [months since entry, price / entry price, VIX-level anchor].
+   1987 predates the VIX; vol there is a VXO-style estimate.
+   ============================================================ */
+const EPISODES = [
+  {
+    id: "1987", name: "Black Monday '87", dates: "Aug 1987 → Aug 1988", tag: "FLASH CRASH",
+    lesson: "−20.5% in a single session (Oct 19), −33% peak to trough in ~3 months. Anyone holding puts through that day was paid at extreme multiples — implied vol went vertical.",
+    path: [[0, 1.000, 18], [1.2, 0.955, 20], [1.6, 0.933, 23], [1.75, 0.836, 35], [1.85, 0.671, 90],
+           [2.1, 0.673, 55], [3.3, 0.665, 40], [4.5, 0.700, 33], [6, 0.735, 28], [9, 0.755, 26], [12, 0.780, 24]],
+  },
+  {
+    id: "2000", name: "Dot-Com Unwind", dates: "Mar 2000 → Oct 2002", tag: "SLOW BLEED",
+    lesson: "−49% over 2.5 years with no single dramatic day — the closest historical rhyme to a deflating AI bubble. Strikes ratchet down as you roll, so each leg often expires just above its strike while the market keeps sinking.",
+    path: [[0, 1.000, 24], [3, 0.951, 22], [6, 0.940, 21], [9, 0.864, 26], [12, 0.760, 32], [15, 0.801, 22],
+           [18, 0.681, 43], [21, 0.751, 24], [24, 0.750, 20], [27, 0.648, 29], [30, 0.535, 40], [31, 0.509, 36]],
+  },
+  {
+    id: "2008", name: "2008 Financial Crisis", dates: "Oct 2007 → Oct 2009", tag: "CASCADING CRISIS",
+    lesson: "A year-long grind that turned into a cascade after Lehman (Sep 2008), bottoming −57% below the peak. Rolling protection got brutally expensive exactly when it mattered — VIX touched 80.",
+    path: [[0, 1.000, 17], [2.7, 0.938, 22], [5.7, 0.845, 26], [8.7, 0.818, 24], [10.7, 0.822, 21],
+           [11.7, 0.746, 39], [12.7, 0.618, 60], [13.7, 0.573, 55], [14.7, 0.577, 40], [16.6, 0.469, 46],
+           [17, 0.432, 49], [20, 0.587, 28], [24, 0.662, 25]],
+  },
+  {
+    id: "2020", name: "COVID Crash", dates: "Feb → Aug 2020", tag: "FLASH CRASH",
+    lesson: "−34% in 23 trading days, then a V-shaped recovery to new highs within six months. The dream case for put insurance: cheap entry (VIX ~14), instant payoff, fast reset.",
+    path: [[0, 1.000, 14], [0.3, 0.873, 40], [0.55, 0.878, 42], [0.8, 0.799, 58], [1.0, 0.681, 66],
+           [1.1, 0.661, 62], [1.25, 0.755, 65], [2.0, 0.851, 38], [3.3, 0.899, 28], [4.4, 0.916, 30], [6, 1.001, 22]],
+  },
+  {
+    id: "2022", name: "2022 Rate Shock", dates: "Jan → Dec 2022", tag: "ORDERLY GRIND",
+    lesson: "−25% over nine months with VIX never sustaining above ~35. The hedge that disappointed: an orderly stairstep decline rarely pierces the deductible deeply before each expiry, so premiums bleed while payouts stay thin.",
+    path: [[0, 1.000, 17], [0.9, 0.941, 24.8], [1.85, 0.912, 30.2], [2.9, 0.944, 20.6], [3.85, 0.861, 33.4],
+           [4.9, 0.862, 26.2], [5.9, 0.789, 28.7], [6.85, 0.861, 21.3], [7.9, 0.824, 25.9], [8.9, 0.747, 31.6],
+           [9.3, 0.746, 33.6], [10.9, 0.851, 20.6], [11.9, 0.801, 21.7]],
+  },
+];
+
+function lerpPath(path, m) {
+  if (m <= path[0][0]) return { px: path[0][1], vix: path[0][2] };
+  for (let i = 1; i < path.length; i++) {
+    if (m <= path[i][0]) {
+      const [m0, p0, v0] = path[i - 1];
+      const [m1, p1, v1] = path[i];
+      const f = (m - m0) / (m1 - m0);
+      return { px: p0 + (p1 - p0) * f, vix: v0 + (v1 - v0) * f };
+    }
+  }
+  const last = path[path.length - 1];
+  return { px: last[1], vix: last[2] };
+}
+
+function runBacktest(episode, horizonMonths, prot) {
+  const path = episode.path;
+  const endM = path[path.length - 1][0];
+  const shares = CAPITAL;
+  const T = horizonMonths / 12;
+  let cumPrem = 0, cumPay = 0, legs = 0;
+  let legStart = 0, legK = -1;
+
+  const openLeg = (m) => {
+    const { px, vix } = lerpPath(path, m);
+    legK = px * (1 - prot);
+    cumPrem += shares * putPrice(px, legK, T, impliedVol(T, prot, vix / 100));
+    legStart = m; legs++;
+  };
+  openLeg(0);
+
+  const rows = [];
+  let minH = Infinity, minU = Infinity;
+  const step = endM / 96;
+  for (let m = 0; m <= endM + 1e-9; m += step) {
+    while (legK > 0 && m - legStart >= horizonMonths - 1e-9) {
+      const expM = legStart + horizonMonths;
+      const { px } = lerpPath(path, expM);
+      cumPay += shares * Math.max(legK - px, 0);
+      if (expM < endM - 0.01) openLeg(expM);
+      else { legK = -1; legStart = expM; }
+    }
+    const { px, vix } = lerpPath(path, m);
+    let putVal = 0;
+    if (legK > 0) {
+      const tLeft = Math.max((legStart + horizonMonths - m) / 12, 0);
+      const otmNow = Math.max((px - legK) / px, 0);
+      putVal = shares * (tLeft <= 1e-4
+        ? Math.max(legK - px, 0)
+        : putPrice(px, legK, tLeft, impliedVol(tLeft, otmNow, vix / 100)));
+    }
+    const unhedged = shares * px;
+    const hedged = unhedged + putVal + cumPay - cumPrem;
+    minH = Math.min(minH, hedged);
+    minU = Math.min(minU, unhedged);
+    rows.push({ month: +m.toFixed(2), unhedged: Math.round(unhedged), hedged: Math.round(hedged) });
+  }
+
+  let openMark = 0;
+  if (legK > 0) {
+    const { px, vix } = lerpPath(path, endM);
+    const tLeft = Math.max((legStart + horizonMonths - endM) / 12, 0);
+    const otmNow = Math.max((px - legK) / px, 0);
+    openMark = shares * (tLeft <= 1e-4
+      ? Math.max(legK - px, 0)
+      : putPrice(px, legK, tLeft, impliedVol(tLeft, otmNow, vix / 100)));
+  }
+
+  const last = rows[rows.length - 1];
+  return {
+    rows, legs, cumPrem, received: cumPay + openMark, endM,
+    finalH: last.hedged, finalU: last.unhedged,
+    ddH: (CAPITAL - minH) / CAPITAL, ddU: (CAPITAL - minU) / CAPITAL,
+  };
+}
+
+/* ---------- config choices ---------- */
+const HORIZONS = [
+  { label: "1 month", months: 1 },
+  { label: "6 months", months: 6 },
+  { label: "1 year", months: 12 },
+  { label: "2 years", months: 24 },
+];
+const PROTECTIONS = [0.05, 0.1, 0.15, 0.2];
+
+const fmt$ = (v) =>
+  v.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+const fmt$2 = (v) =>
+  v.toLocaleString("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 2 });
+const fmtPct = (v, d = 1) => `${(v * 100).toFixed(d)}%`;
+
+/* ============================================================ */
+function App() {
+  const [horizonIdx, setHorizonIdx] = useState(2);
+  const [protIdx, setProtIdx] = useState(1);
+  const [crashSize, setCrashSize] = useState(0.2);
+  const [crashMonth, setCrashMonth] = useState(3);
+  const [driftMonth, setDriftMonth] = useState(6);
+  const [showNotes, setShowNotes] = useState(false);
+  const [episodeIdx, setEpisodeIdx] = useState(1);
+
+  const horizon = HORIZONS[horizonIdx];
+  const T = horizon.months / 12;
+  const prot = PROTECTIONS[protIdx];
+  const strike = SPOT * (1 - prot);
+  const shares = CAPITAL / SPOT;
+
+  const model = useMemo(() => {
+    const sigma = impliedVol(T, prot);
+    const premiumPerShare = putPrice(SPOT, strike, T, sigma);
+    const premium = premiumPerShare * shares;
+    const premiumPct = premium / CAPITAL;
+    const annualDrag = premiumPct / T;
+    const floorValue = shares * strike - premium;
+    const maxLoss = CAPITAL - floorValue;
+    const breakeven = premiumPct / (1 - DIV * T);
+    const thetaDay =
+      (putPrice(SPOT, strike, Math.max(T - 1 / 365, 1e-6), sigma) - premiumPerShare) * shares;
+
+    const payoff = [];
+    for (let m = -0.4; m <= 0.301; m += 0.01) {
+      const endPx = SPOT * (1 + m);
+      const unhedged = shares * endPx;
+      const hedged = shares * endPx + shares * Math.max(strike - endPx, 0) - premium;
+      payoff.push({
+        move: Math.round(m * 100),
+        unhedged: Math.round(unhedged),
+        hedged: Math.round(hedged),
+      });
+    }
+
+    const maxM = horizon.months;
+    const timing = [];
+    for (let mth = 0; mth <= maxM; mth += maxM / 24) {
+      const tLeft = Math.max(T - mth / 12, 0);
+      const crashedPx = SPOT * (1 - crashSize);
+      const putVal =
+        tLeft <= 0.001
+          ? Math.max(strike - crashedPx, 0)
+          : putPrice(crashedPx, strike, tLeft, crashVol(tLeft, crashSize));
+      const hedged = shares * crashedPx + shares * putVal - premium;
+      timing.push({
+        month: +mth.toFixed(2),
+        hedged: Math.round(hedged),
+        unhedged: Math.round(shares * crashedPx),
+      });
+    }
+
+    const decay = [];
+    const dSteps = 48;
+    for (let i = 0; i <= dSteps; i++) {
+      const mth = (maxM * i) / dSteps;
+      const tLeft = Math.max(T - mth / 12, 0);
+      const flatVal =
+        tLeft <= 0.001
+          ? Math.max(strike - SPOT, 0)
+          : putPrice(SPOT, strike, tLeft, impliedVol(tLeft, prot));
+      const progress = driftMonth > 0 ? Math.min(mth / driftMonth, 1) : 1;
+      const px = SPOT + (strike - SPOT) * progress;
+      const ddown = (SPOT - px) / SPOT;
+      const otmNow = Math.max((px - strike) / SPOT, 0);
+      const volNow = Math.min(impliedVol(tLeft, otmNow) + ddown * 1.0, 0.6);
+      const driftVal =
+        tLeft <= 0.001 ? Math.max(strike - px, 0) : putPrice(px, strike, tLeft, volNow);
+      decay.push({
+        month: +mth.toFixed(2),
+        flat: Math.round(flatVal * shares * 100) / 100,
+        drift: Math.round(driftVal * shares * 100) / 100,
+      });
+    }
+
+    const tLeftTouch = Math.max(T - driftMonth / 12, 0);
+    const volTouch = Math.min(impliedVol(tLeftTouch, 0) + prot * 1.0, 0.6);
+    const strikeTouchVal =
+      (tLeftTouch <= 0.001 ? 0 : putPrice(strike, strike, tLeftTouch, volTouch)) * shares;
+
+    const tLeftSel = Math.max(T - crashMonth / 12, 0);
+    const crashedPx = SPOT * (1 - crashSize);
+    const putSel =
+      tLeftSel <= 0.001
+        ? Math.max(strike - crashedPx, 0)
+        : putPrice(crashedPx, strike, tLeftSel, crashVol(tLeftSel, crashSize));
+    const hedgedSel = shares * crashedPx + shares * putSel - premium;
+    const unhedgedSel = shares * crashedPx;
+
+    const histStep = 3;
+    const main = [];
+    HISTORY.forEach((p, i) => {
+      if (i % histStep === 0)
+        main.push({ x: i - HISTORY.length, price: Math.round(p * 100) / 100 });
+    });
+    const fwdDays = Math.round((horizon.months / 12) * 252);
+    for (let i = 0; i <= fwdDays; i += Math.max(Math.round(fwdDays / 40), 1)) {
+      main.push({ x: i, floor: Math.round(strike * 100) / 100 });
+    }
+
+    return {
+      sigma, premium, premiumPct, annualDrag, floorValue, maxLoss, breakeven,
+      payoff, timing, main, hedgedSel, unhedgedSel, putSel,
+      decay, thetaDay, strikeTouchVal,
+    };
+  }, [T, prot, strike, shares, horizon.months, crashSize, crashMonth, driftMonth]);
+
+  const ep = EPISODES[episodeIdx];
+  const bt = useMemo(
+    () => runBacktest(ep, horizon.months, prot),
+    [ep, horizon.months, prot]
+  );
+  const verdict =
+    bt.finalH > bt.finalU
+      ? `With your settings, insurance finished ${fmt$(bt.finalH - bt.finalU)} ahead of going unprotected and cut the worst drawdown from −${fmtPct(bt.ddU)} to −${fmtPct(bt.ddH)}.`
+      : `With your settings, insurance finished ${fmt$(bt.finalU - bt.finalH)} behind going unprotected — ${bt.legs} round${bt.legs === 1 ? "" : "s"} of premium outran the payouts, though the worst drawdown was still trimmed from −${fmtPct(bt.ddU)} to −${fmtPct(bt.ddH)}.`;
+
+  const s = styles;
+
+  return (
+    <div style={s.page}>
+      <div style={s.wrap}>
+        <header style={s.header}>
+          <div>
+            <div style={s.eyebrow}>PORTFOLIO INSURANCE DESK</div>
+            <h1 style={s.h1}>Protective Put Simulator</h1>
+            <p style={s.sub}>
+              $10,000 in the S&amp;P 500 (SPY&nbsp;{fmt$2(SPOT)}) · VIX {(VIX * 100).toFixed(1)} ·
+              data as of {AS_OF}
+            </p>
+            <p style={s.dataNote}>data source: {DATA_NOTE}</p>
+            <button onClick={() => setShowNotes(!showNotes)} style={s.notesLink}>
+              {showNotes ? "Hide personal notes ↑" : "Personal notes — why I built this →"}
+            </button>
+          </div>
+          <div style={s.spotBox}>
+            <div style={s.spotLabel}>YOUR POSITION</div>
+            <div style={s.spotVal}>{fmt$(CAPITAL)}</div>
+            <div style={s.spotSub}>{shares.toFixed(3)} SPY-equivalent shares</div>
+          </div>
+        </header>
+
+        {showNotes && (
+          <section style={s.notesCard}>
+            <div style={s.notesHead}>PERSONAL NOTES — FROM THE BUILDER</div>
+            <div style={s.notesText}>
+              <p>Hi everyone,</p>
+              <p>I hope you're doing well. I wanted to briefly share why I put this project
+              together and why I thought it was interesting.</p>
+              <p>Working in banking, through everyday client conversations I have noticed that
+              most people have their savings sitting in the S&amp;P 500 with nothing underneath
+              it. With the current market uncertainties, and the whole AI bubble incentive
+              driving valuations at this time, I felt it would be very interesting for people
+              to see what insurance coverage on a portfolio actually looks like — what it
+              costs, what it protects, and what it pays back if the downturn comes early</p>
+              <p>Most people insure their car, their home, and their health, but not the money
+              they worked hardest to build. Options get treated like gambling, when the same
+              contract can work like a policy with a deductible and a term. I built this so
+              anyone could see the trade-off in plain numbers — the cost of being protected vs
+              the cost of being wrong — and make a thoughtful, needs-based decision for
+              themselves.</p>
+              <p>This started as a personal learning project and I hope it helps you look at
+              hedging the same way I started to.</p>
+              <p>Best,<br />David</p>
+            </div>
+          </section>
+        )}
+
+        <section style={s.controls}>
+          <div>
+            <div style={s.controlLabel}>COVERAGE PERIOD — put expiry</div>
+            <div style={s.btnRow}>
+              {HORIZONS.map((h, i) => (
+                <button key={h.label}
+                  onClick={() => { setHorizonIdx(i); setCrashMonth(Math.min(crashMonth, h.months)); setDriftMonth(Math.min(driftMonth, h.months)); }}
+                  style={{ ...s.btn, ...(i === horizonIdx ? s.btnOn : {}) }}>
+                  {h.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <div style={s.controlLabel}>DEDUCTIBLE — losses you absorb before insurance kicks in</div>
+            <div style={s.btnRow}>
+              {PROTECTIONS.map((p, i) => (
+                <button key={p} onClick={() => setProtIdx(i)}
+                  style={{ ...s.btn, ...(i === protIdx ? s.btnOn : {}) }}>
+                  first {fmtPct(p, 0)}
+                </button>
+              ))}
+            </div>
+            <div style={s.hint}>
+              Put strike {fmt$2(strike)} — every dollar of decline beyond −{fmtPct(prot, 0)} is covered.
+            </div>
+          </div>
+        </section>
+
+        <section style={s.statGrid}>
+          <Stat label="Insurance cost (premium)" value={fmt$2(model.premium)}
+            sub={`${fmtPct(model.premiumPct)} of portfolio · IV ${fmtPct(model.sigma)}`} tone="amber" s={s} />
+          <Stat label="Annualized drag" value={fmtPct(model.annualDrag)}
+            sub="cost per year if renewed at same price" tone="ink" s={s} />
+          <Stat label="Guaranteed floor at expiry" value={fmt$(model.floorValue)}
+            sub={`worst case = −${fmtPct(model.maxLoss / CAPITAL)} (deductible + premium)`} tone="teal" s={s} />
+          <Stat label="Upside needed to break even" value={`+${fmtPct(model.breakeven)}`}
+            sub="market gain that pays for the hedge" tone="ink" s={s} />
+        </section>
+
+        <Panel title="MARKET VIEW" sub={`SPY, trailing 12 months + your ${horizon.label} protection window`} s={s}>
+          <ResponsiveContainer width="100%" height={260}>
+            <ComposedChart data={model.main} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
+              <CartesianGrid stroke="#E4E9EF" strokeDasharray="0" vertical={false} />
+              <XAxis dataKey="x" tick={{ fontSize: 11, fill: "#7A8899" }}
+                tickFormatter={(v) => (v === 0 ? "today" : v < 0 ? `${Math.round(v / 21)}mo` : `+${Math.round(v / 21)}mo`)}
+                type="number" domain={["dataMin", "dataMax"]} />
+              <YAxis tick={{ fontSize: 11, fill: "#7A8899" }} domain={["auto", "auto"]}
+                tickFormatter={(v) => `$${v}`} width={52} />
+              <Tooltip formatter={(v, n) => [fmt$2(v), n === "price" ? "SPY" : "protection floor"]}
+                labelFormatter={() => ""} contentStyle={s.tooltip} />
+              <Line dataKey="price" stroke="#1D5FBF" strokeWidth={2} dot={false} name="price" connectNulls={false} />
+              <Line dataKey="floor" stroke="#0E7C66" strokeWidth={2.5} strokeDasharray="6 4" dot={false} name="floor" />
+              <ReferenceLine x={0} stroke="#16202E" strokeWidth={1}
+                label={{ value: "TODAY", fontSize: 10, fill: "#16202E", position: "top" }} />
+            </ComposedChart>
+          </ResponsiveContainer>
+          <div style={s.legendNote}>
+            <span style={{ color: "#1D5FBF" }}>■</span> SPY price&nbsp;&nbsp;
+            <span style={{ color: "#0E7C66" }}>▪▪</span> insured floor {fmt$2(strike)} — active for the next {horizon.label}
+          </div>
+        </Panel>
+
+        <Panel title="OUTCOME AT EXPIRY" sub="what your $10,000 becomes across every market outcome" s={s}>
+          <ResponsiveContainer width="100%" height={280}>
+            <ComposedChart data={model.payoff} margin={{ top: 8, right: 12, left: 0, bottom: 4 }}>
+              <CartesianGrid stroke="#E4E9EF" vertical={false} />
+              <XAxis dataKey="move" tick={{ fontSize: 11, fill: "#7A8899" }}
+                tickFormatter={(v) => `${v}%`}
+                label={{ value: "S&P 500 move by expiry", fontSize: 11, fill: "#7A8899", dy: 14 }} />
+              <YAxis tick={{ fontSize: 11, fill: "#7A8899" }} tickFormatter={(v) => `$${(v / 1000).toFixed(0)}k`}
+                width={44} domain={[5500, 13500]} />
+              <Tooltip contentStyle={s.tooltip}
+                formatter={(v, n) => [fmt$(v), n === "hedged" ? "With insurance" : "No insurance"]}
+                labelFormatter={(l) => `Market ${l >= 0 ? "+" : ""}${l}%`} />
+              <Legend wrapperStyle={{ fontSize: 12 }}
+                formatter={(v) => (v === "hedged" ? "With insurance" : "No insurance")} />
+              <ReferenceLine y={CAPITAL} stroke="#B9C3CE" strokeDasharray="3 3" />
+              <ReferenceLine y={model.floorValue} stroke="#0E7C66" strokeDasharray="6 4"
+                label={{ value: `floor ${fmt$(model.floorValue)}`, fontSize: 10, fill: "#0E7C66", position: "insideBottomLeft" }} />
+              <Line dataKey="unhedged" stroke="#C43D3D" strokeWidth={2} dot={false} />
+              <Line dataKey="hedged" stroke="#0E7C66" strokeWidth={2.5} dot={false} />
+            </ComposedChart>
+          </ResponsiveContainer>
+          <div style={s.legendNote}>
+            Left of −{fmtPct(prot, 0)} the green line goes flat: that's the insurance paying out. In calm or rising
+            markets the hedged line sits {fmt$2(model.premium)} below the unhedged one — that gap is the premium you paid.
+          </div>
+        </Panel>
+
+        <Panel title="IF THE CRASH COMES EARLY" sub="the same crash pays more the sooner it hits — time value + volatility spike" s={s}>
+          <div style={s.sliderRow}>
+            <div>
+              <div style={s.controlLabel}>CRASH SIZE — {fmtPct(crashSize, 0)} drop</div>
+              <input type="range" min={5} max={40} step={1} value={crashSize * 100}
+                onChange={(e) => setCrashSize(+e.target.value / 100)} style={s.slider} />
+            </div>
+            <div>
+              <div style={s.controlLabel}>ARRIVES AFTER — {crashMonth.toFixed(1)} month{crashMonth === 1 ? "" : "s"}</div>
+              <input type="range" min={0} max={horizon.months} step={horizon.months / 24} value={crashMonth}
+                onChange={(e) => setCrashMonth(+e.target.value)} style={s.slider} />
+            </div>
+          </div>
+
+          <ResponsiveContainer width="100%" height={240}>
+            <ComposedChart data={model.timing} margin={{ top: 8, right: 12, left: 0, bottom: 4 }}>
+              <CartesianGrid stroke="#E4E9EF" vertical={false} />
+              <XAxis dataKey="month" tick={{ fontSize: 11, fill: "#7A8899" }}
+                tickFormatter={(v) => `${v}mo`} type="number" domain={[0, horizon.months]} />
+              <YAxis tick={{ fontSize: 11, fill: "#7A8899" }} tickFormatter={(v) => `$${(v / 1000).toFixed(1)}k`}
+                width={52} domain={["auto", "auto"]} />
+              <Tooltip contentStyle={s.tooltip}
+                formatter={(v, n) => [fmt$(v), n === "hedged" ? "With insurance" : "No insurance"]}
+                labelFormatter={(l) => `Crash at month ${l}`} />
+              <Line dataKey="unhedged" stroke="#C43D3D" strokeWidth={2} strokeDasharray="4 3" dot={false} />
+              <Line dataKey="hedged" stroke="#0E7C66" strokeWidth={2.5} dot={false} />
+              <ReferenceLine x={crashMonth} stroke="#16202E" strokeWidth={1} />
+            </ComposedChart>
+          </ResponsiveContainer>
+
+          <div style={s.crashResult}>
+            <div style={s.crashCol}>
+              <div style={s.crashLabel}>No insurance</div>
+              <div style={{ ...s.crashVal, color: "#C43D3D" }}>{fmt$(model.unhedgedSel)}</div>
+              <div style={s.crashSub}>−{fmtPct((CAPITAL - model.unhedgedSel) / CAPITAL)}</div>
+            </div>
+            <div style={s.crashCol}>
+              <div style={s.crashLabel}>With insurance</div>
+              <div style={{ ...s.crashVal, color: "#0E7C66" }}>{fmt$(model.hedgedSel)}</div>
+              <div style={s.crashSub}>−{fmtPct((CAPITAL - model.hedgedSel) / CAPITAL)}</div>
+            </div>
+            <div style={s.crashCol}>
+              <div style={s.crashLabel}>Put value if sold now</div>
+              <div style={{ ...s.crashVal, color: "#B07A1E" }}>{fmt$2(model.putSel * shares)}</div>
+              <div style={s.crashSub}>
+                paid {fmt$2(model.premium)} → {model.premium > 0 ? `${(model.putSel * shares / model.premium).toFixed(1)}×` : "—"} return on premium
+              </div>
+            </div>
+          </div>
+        </Panel>
+
+        <Panel title="TIME DECAY & SELL-BACK VALUE"
+          sub="hold flat and the premium melts — grind toward your strike and time value builds" s={s}>
+          <div style={s.sliderRow}>
+            <div>
+              <div style={s.controlLabel}>
+                MARKET REACHES YOUR STRIKE (−{fmtPct(prot, 0)}) AFTER — {driftMonth.toFixed(1)} month{driftMonth === 1 ? "" : "s"}
+              </div>
+              <input type="range" min={0} max={horizon.months} step={horizon.months / 24} value={driftMonth}
+                onChange={(e) => setDriftMonth(+e.target.value)} style={s.slider} />
+            </div>
+          </div>
+
+          <ResponsiveContainer width="100%" height={250}>
+            <ComposedChart data={model.decay} margin={{ top: 8, right: 12, left: 0, bottom: 4 }}>
+              <CartesianGrid stroke="#E4E9EF" vertical={false} />
+              <XAxis dataKey="month" tick={{ fontSize: 11, fill: "#7A8899" }}
+                tickFormatter={(v) => `${v}mo`} type="number" domain={[0, horizon.months]} />
+              <YAxis tick={{ fontSize: 11, fill: "#7A8899" }} tickFormatter={(v) => `$${Math.round(v)}`}
+                width={52} domain={[0, "auto"]} />
+              <Tooltip contentStyle={s.tooltip}
+                formatter={(v, n) => [fmt$2(v), n === "drift" ? "Grinds to strike" : "Market stays flat"]}
+                labelFormatter={(l) => `Month ${l}`} />
+              <Legend wrapperStyle={{ fontSize: 12 }}
+                formatter={(v) => (v === "drift" ? "Market grinds down to strike" : "Market stays flat (pure decay)")} />
+              <ReferenceLine y={Math.round(model.premium * 100) / 100} stroke="#B07A1E" strokeDasharray="2 4"
+                label={{ value: `premium paid ${fmt$2(model.premium)}`, fontSize: 10, fill: "#B07A1E", position: "insideTopRight" }} />
+              <ReferenceLine x={driftMonth} stroke="#16202E" strokeWidth={1}
+                label={{ value: "strike touched", fontSize: 10, fill: "#16202E", position: "top" }} />
+              <Line dataKey="flat" stroke="#C43D3D" strokeWidth={2} strokeDasharray="5 4" dot={false} />
+              <Line dataKey="drift" stroke="#0E7C66" strokeWidth={2.5} dot={false} />
+            </ComposedChart>
+          </ResponsiveContainer>
+
+          <div style={s.crashResult}>
+            <div style={s.crashCol}>
+              <div style={s.crashLabel}>Theta today</div>
+              <div style={{ ...s.crashVal, color: "#C43D3D" }}>−{fmt$2(Math.abs(model.thetaDay))}</div>
+              <div style={s.crashSub}>value lost per day, all else equal</div>
+            </div>
+            <div style={s.crashCol}>
+              <div style={s.crashLabel}>Sellable time value at the touch</div>
+              <div style={{ ...s.crashVal, color: "#0E7C66" }}>{fmt$2(model.strikeTouchVal)}</div>
+              <div style={s.crashSub}>intrinsic is $0 at the strike — this is pure time value + vol</div>
+            </div>
+            <div style={s.crashCol}>
+              <div style={s.crashLabel}>vs premium paid</div>
+              <div style={{ ...s.crashVal, color: "#B07A1E" }}>
+                {model.premium > 0 ? `${(model.strikeTouchVal / model.premium).toFixed(1)}×` : "—"}
+              </div>
+              <div style={s.crashSub}>return on premium if sold at the touch</div>
+            </div>
+          </div>
+
+          <div style={s.legendNote}>
+            The red dashed line is pure theta: it starts at the {fmt$2(model.premium)} you paid and bends toward
+            $0 — decay isn't linear, it accelerates in the final stretch. The green line rises while the market
+            grinds down (delta gains beat the decay), <strong>peaks near the touch</strong>, then decay takes over
+            if you keep holding. Two takeaways: sell into the move rather than holding a winner to expiry, and
+            note that reaching the strike exactly <em>at</em> expiry leaves nothing to sell — the earlier the market
+            gets there, the more time value survives. Grind scenario assumes a milder vol rise (~1 pt per 1% drop)
+            than the sudden-crash panel above.
+          </div>
+        </Panel>
+
+        <Panel title="CRASH TIME MACHINE"
+          sub={`your exact hedge (${horizon.label} puts, ${fmtPct(prot, 0)} deductible, rolled at every expiry) replayed through real history`} s={s}>
+          <div style={s.btnRow}>
+            {EPISODES.map((e, i) => (
+              <button key={e.id} onClick={() => setEpisodeIdx(i)}
+                style={{ ...s.btn, ...(i === episodeIdx ? s.btnOn : {}) }}>
+                {e.name}
+              </button>
+            ))}
+          </div>
+          <div style={s.episodeMeta}>
+            <span style={s.tag}>{ep.tag}</span>
+            <span>{ep.dates} · entry at the pre-crash peak with $10,000</span>
+          </div>
+
+          <ResponsiveContainer width="100%" height={260}>
+            <ComposedChart data={bt.rows} margin={{ top: 8, right: 12, left: 0, bottom: 4 }}>
+              <CartesianGrid stroke="#E4E9EF" vertical={false} />
+              <XAxis dataKey="month" tick={{ fontSize: 11, fill: "#7A8899" }}
+                tickFormatter={(v) => `${Math.round(v)}mo`} type="number" domain={[0, bt.endM]} />
+              <YAxis tick={{ fontSize: 11, fill: "#7A8899" }}
+                tickFormatter={(v) => `$${(v / 1000).toFixed(1)}k`} width={52} domain={["auto", "auto"]} />
+              <Tooltip contentStyle={s.tooltip}
+                formatter={(v, n) => [fmt$(v), n === "hedged" ? "With insurance (rolled)" : "No insurance"]}
+                labelFormatter={(l) => `Month ${l}`} />
+              <Legend wrapperStyle={{ fontSize: 12 }}
+                formatter={(v) => (v === "hedged" ? "With insurance (rolled)" : "No insurance")} />
+              <ReferenceLine y={CAPITAL} stroke="#B9C3CE" strokeDasharray="3 3" />
+              <Line dataKey="unhedged" stroke="#C43D3D" strokeWidth={2} dot={false} />
+              <Line dataKey="hedged" stroke="#0E7C66" strokeWidth={2.5} dot={false} />
+            </ComposedChart>
+          </ResponsiveContainer>
+
+          <div style={s.crashResult}>
+            <div style={s.crashCol}>
+              <div style={s.crashLabel}>No insurance</div>
+              <div style={{ ...s.crashVal, color: "#C43D3D" }}>{fmt$(bt.finalU)}</div>
+              <div style={s.crashSub}>worst point −{fmtPct(bt.ddU)}</div>
+            </div>
+            <div style={s.crashCol}>
+              <div style={s.crashLabel}>With insurance</div>
+              <div style={{ ...s.crashVal, color: "#0E7C66" }}>{fmt$(bt.finalH)}</div>
+              <div style={s.crashSub}>worst point −{fmtPct(bt.ddH)}</div>
+            </div>
+            <div style={s.crashCol}>
+              <div style={s.crashLabel}>Premiums paid</div>
+              <div style={{ ...s.crashVal, color: "#B07A1E" }}>{fmt$(bt.cumPrem)}</div>
+              <div style={s.crashSub}>{bt.legs} put leg{bt.legs === 1 ? "" : "s"} bought</div>
+            </div>
+            <div style={s.crashCol}>
+              <div style={s.crashLabel}>Insurance received</div>
+              <div style={{ ...s.crashVal, color: "#16202E" }}>{fmt$(bt.received)}</div>
+              <div style={s.crashSub}>payouts + final put value</div>
+            </div>
+          </div>
+
+          <div style={s.legendNote}>
+            {ep.lesson} {verdict} Try flipping between 1-month and 1-year puts on the Dot-Com
+            Unwind vs the COVID Crash — flash crashes reward any hedge, while slow bleeds
+            punish short-dated rolling.
+          </div>
+        </Panel>
+
+        <footer style={s.footer}>
+          <div style={s.discHead}>DISCLOSURES</div>
+          <p><strong>Not financial advice.</strong> This tool is provided for informational and
+          educational purposes only. Nothing on this page constitutes financial, investment,
+          legal, tax, or accounting advice, or an offer, solicitation, or recommendation to buy
+          or sell any security, option, or other financial instrument. The creator is not a
+          registered investment advisor, broker-dealer, or licensed financial professional
+          acting in that capacity here.</p>
+          <p><strong>Options risk.</strong> Options involve substantial risk and are not
+          suitable for all investors. You can lose 100% of the premium paid. Before trading
+          options, read "Characteristics and Risks of Standardized Options" published by the
+          Options Clearing Corporation.</p>
+          <p><strong>Hypothetical results.</strong> All figures are theoretical model outputs
+          (Black-Scholes with modeled volatility) based on end-of-day data as of {AS_OF};
+          they are not live quotes and will differ from actual, tradable prices. The trailing
+          price chart uses end-of-day closes (Stooq / CBOE / FRED) when live data loads; if it
+          cannot load, a simulated fallback is shown and labeled in the header.
+          Historical crash episodes are stylized reconstructions from public index and
+          volatility records (weekly/monthly anchor points, interpolated), not exact daily
+          prices; 1987 predates the VIX, so its volatility is estimated. Past
+          performance does not guarantee future results, and hypothetical projections have
+          inherent limitations.</p>
+          <p><strong>No warranty; limitation of liability.</strong> This tool is provided "as
+          is" and "as available," without warranties of any kind, express or implied, including
+          accuracy, completeness, timeliness, or fitness for a particular purpose. To the
+          maximum extent permitted by law, the creator accepts no liability for any loss or
+          damage, direct or indirect, arising from the use of, or reliance on, this tool or its
+          outputs. By using this tool you accept full responsibility for your own decisions.
+          Always consult a licensed financial advisor before making any investment decision.</p>
+          <p><strong>Model notes.</strong> Puts are priced with Black-Scholes using the CBOE
+          volatility term structure (VIX9D / VIX / VIX3M / VIX6M, interpolated) when available,
+          otherwise VIX {(VIX * 100).toFixed(1)} plus a modeled contango, with an OTM-skew
+          adjustment matching typical SPX surfaces; r = {(RATE * 100).toFixed(2)}% (3-month
+          T-bill), dividend yield = {(DIV * 100).toFixed(1)}%. Early-crash values assume implied
+          volatility spikes with the drawdown; the gradual-grind scenario assumes a milder vol
+          rise. One SPY put covers 100 shares of notional — read these figures as per-$10,000
+          units of a larger portfolio, or consider smaller instruments (XSP, put spreads).</p>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+function Stat({ label, value, sub, tone, s }) {
+  const colors = { amber: "#B07A1E", teal: "#0E7C66", ink: "#16202E" };
+  return (
+    <div style={s.stat}>
+      <div style={s.statLabel}>{label}</div>
+      <div style={{ ...s.statVal, color: colors[tone] }}>{value}</div>
+      <div style={s.statSub}>{sub}</div>
+    </div>
+  );
+}
+
+function Panel({ title, sub, children, s }) {
+  return (
+    <section style={s.panel}>
+      <div style={s.panelHead}>
+        <span style={s.panelTitle}>{title}</span>
+        <span style={s.panelSub}>{sub}</span>
+      </div>
+      {children}
+    </section>
+  );
+}
+
+const mono = "'SF Mono','JetBrains Mono',ui-monospace,Menlo,monospace";
+const sans = "'Avenir Next','Segoe UI',system-ui,-apple-system,sans-serif";
+
+const styles = {
+  page: {
+    minHeight: "100vh", background: "#F4F6F8", padding: "20px 12px",
+    backgroundImage: "linear-gradient(#E9EDF1 1px, transparent 1px), linear-gradient(90deg, #E9EDF1 1px, transparent 1px)",
+    backgroundSize: "28px 28px", fontFamily: sans, color: "#16202E",
+  },
+  wrap: { maxWidth: 880, margin: "0 auto" },
+  header: {
+    display: "flex", justifyContent: "space-between", alignItems: "flex-end",
+    flexWrap: "wrap", gap: 16, marginBottom: 20,
+  },
+  eyebrow: { fontFamily: mono, fontSize: 11, letterSpacing: "0.18em", color: "#0E7C66", marginBottom: 6 },
+  h1: { fontSize: 30, fontWeight: 800, margin: 0, letterSpacing: "-0.02em" },
+  sub: { fontFamily: mono, fontSize: 12, color: "#7A8899", margin: "6px 0 0" },
+  dataNote: { fontFamily: mono, fontSize: 10.5, color: "#9AA7B4", margin: "4px 0 0" },
+  spotBox: {
+    background: "#16202E", color: "#F4F6F8", padding: "12px 18px",
+    borderRadius: 4, minWidth: 190,
+  },
+  spotLabel: { fontFamily: mono, fontSize: 10, letterSpacing: "0.15em", color: "#8FA0B3" },
+  spotVal: { fontFamily: mono, fontSize: 26, fontWeight: 700, margin: "2px 0" },
+  spotSub: { fontFamily: mono, fontSize: 11, color: "#8FA0B3" },
+
+  controls: {
+    background: "#FFFFFF", border: "1px solid #DCE3EA", borderRadius: 6,
+    padding: 18, display: "grid", gap: 18, marginBottom: 16,
+  },
+  controlLabel: { fontFamily: mono, fontSize: 11, letterSpacing: "0.12em", color: "#4A5A6D", marginBottom: 8 },
+  btnRow: { display: "flex", gap: 8, flexWrap: "wrap" },
+  btn: {
+    fontFamily: mono, fontSize: 13, padding: "9px 16px", borderRadius: 4,
+    border: "1px solid #C4CEDA", background: "#FFFFFF", color: "#16202E",
+    cursor: "pointer", transition: "all .15s",
+  },
+  btnOn: { background: "#16202E", color: "#FFFFFF", borderColor: "#16202E" },
+  hint: { fontSize: 12, color: "#7A8899", marginTop: 8 },
+
+  statGrid: {
+    display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px,1fr))",
+    gap: 10, marginBottom: 16,
+  },
+  stat: { background: "#FFFFFF", border: "1px solid #DCE3EA", borderRadius: 6, padding: "14px 16px" },
+  statLabel: { fontFamily: mono, fontSize: 10, letterSpacing: "0.1em", color: "#7A8899", textTransform: "uppercase" },
+  statVal: { fontFamily: mono, fontSize: 22, fontWeight: 700, margin: "4px 0 2px" },
+  statSub: { fontSize: 11.5, color: "#7A8899", lineHeight: 1.4 },
+
+  panel: { background: "#FFFFFF", border: "1px solid #DCE3EA", borderRadius: 6, padding: 18, marginBottom: 16 },
+  panelHead: { display: "flex", alignItems: "baseline", gap: 12, flexWrap: "wrap", marginBottom: 12 },
+  panelTitle: { fontFamily: mono, fontSize: 12, fontWeight: 700, letterSpacing: "0.14em", color: "#16202E" },
+  panelSub: { fontSize: 12, color: "#7A8899" },
+  legendNote: { fontSize: 12, color: "#4A5A6D", marginTop: 10, lineHeight: 1.5 },
+  tooltip: { fontFamily: mono, fontSize: 12, border: "1px solid #DCE3EA", borderRadius: 4 },
+
+  sliderRow: { display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(240px,1fr))", gap: 16, marginBottom: 12 },
+  slider: { width: "100%", accentColor: "#0E7C66" },
+
+  crashResult: {
+    display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(150px,1fr))",
+    gap: 10, marginTop: 12, borderTop: "1px solid #E4E9EF", paddingTop: 14,
+  },
+  crashCol: { textAlign: "center" },
+  crashLabel: { fontFamily: mono, fontSize: 10, letterSpacing: "0.1em", color: "#7A8899", textTransform: "uppercase" },
+  crashVal: { fontFamily: mono, fontSize: 21, fontWeight: 700, margin: "4px 0 2px" },
+  crashSub: { fontSize: 11.5, color: "#7A8899" },
+
+  footer: { fontSize: 11.5, color: "#7A8899", lineHeight: 1.6, padding: "4px 6px 20px" },
+  discHead: { fontFamily: mono, fontSize: 11, fontWeight: 700, letterSpacing: "0.14em", color: "#4A5A6D", marginBottom: 8 },
+
+  notesLink: {
+    fontFamily: mono, fontSize: 12, color: "#0E7C66", background: "none",
+    border: "none", padding: 0, marginTop: 10, cursor: "pointer",
+    textDecoration: "underline", textUnderlineOffset: 3, display: "block",
+  },
+  notesCard: {
+    background: "#FFFDF6", border: "1px solid #E4D9B8", borderLeft: "4px solid #B07A1E",
+    borderRadius: 6, padding: "18px 20px", marginBottom: 16,
+  },
+  notesHead: { fontFamily: mono, fontSize: 11, fontWeight: 700, letterSpacing: "0.14em", color: "#B07A1E", marginBottom: 10 },
+  notesText: { fontSize: 14, color: "#3A4553", lineHeight: 1.7 },
+
+  episodeMeta: { display: "flex", gap: 10, alignItems: "center", margin: "10px 0 6px", fontSize: 12, color: "#7A8899", flexWrap: "wrap" },
+  tag: { fontFamily: mono, fontSize: 10, letterSpacing: "0.1em", background: "#16202E", color: "#F4F6F8", padding: "3px 8px", borderRadius: 3 },
+};
+
+/* ---------- bootstrap: load freshest data, then render ---------- */
+async function fetchJson(u) {
+  try {
+    const r = await fetch(u, { cache: "no-store" });
+    if (r.ok) {
+      const d = await r.json();
+      if (d && d.spy && d.spy.price) return d;
+    }
+  } catch (e) {}
+  return null;
+}
+
+(async () => {
+  const local = await fetchJson("./data/market.json");
+  const remote = GITHUB_RAW_DATA_URL.includes("YOUR_GITHUB_USERNAME")
+    ? null
+    : await fetchJson(GITHUB_RAW_DATA_URL);
+  const newer = (a, b) => (!a ? b : !b ? a : ((b.asOf || "") > (a.asOf || "") ? b : a));
+  const d = newer(local, remote);
+  if (d) applyData(d, d === remote ? "GitHub raw · live EOD" : "server file · live EOD");
+  else applyData(FALLBACK, "bundled fallback snapshot — live feed unavailable");
+  ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+})();
+</script>
+</body>
+</html>
