@@ -40,7 +40,9 @@ jobs:
       # so data still updates automatically with no AWS credentials here.
       # ---------------------------------------------------------------
 
-      # MODE 1 — site hosted on S3 (+ optional CloudFront)
+      # MODE 1 — simulator hosted under /projects/protective-put/ on S3
+      # (+ optional CloudFront). The fixed prefix keeps --delete away from
+      # the personal site's root files.
       # Authentication uses GitHub OIDC and a least-privilege AWS role.
       # Variables needed: DEPLOY_MODE=s3, AWS_REGION, S3_BUCKET,
       #                   CLOUDFRONT_ID (optional)
@@ -51,27 +53,44 @@ jobs:
           role-to-assume: arn:aws:iam::555545761964:role/GitHubActionsDeployDavidJiaMarketSite
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Sync site to S3
+      - name: Sync simulator project to S3
         if: vars.DEPLOY_MODE == 's3'
-        run: aws s3 sync site/ s3://${{ vars.S3_BUCKET }} --delete
+        run: |
+          PROJECT_PREFIX="projects/protective-put"
+          aws s3 sync site/ "s3://${{ vars.S3_BUCKET }}/${PROJECT_PREFIX}/" \
+            --delete --exclude "index.html" --exclude "data/market.json" --only-show-errors
+          aws s3 cp site/index.html "s3://${{ vars.S3_BUCKET }}/${PROJECT_PREFIX}/index.html" \
+            --content-type "text/html; charset=utf-8" \
+            --cache-control "no-cache, max-age=0, must-revalidate" \
+            --only-show-errors
+          aws s3 cp site/data/market.json "s3://${{ vars.S3_BUCKET }}/${PROJECT_PREFIX}/data/market.json" \
+            --content-type "application/json" \
+            --cache-control "no-store, max-age=0" \
+            --only-show-errors
 
       - name: Invalidate CloudFront cache
         if: vars.DEPLOY_MODE == 's3' && vars.CLOUDFRONT_ID != ''
         run: >
           aws cloudfront create-invalidation
           --distribution-id ${{ vars.CLOUDFRONT_ID }}
-          --paths "/" "/index.html" "/data/market.json"
+          --paths "/projects/protective-put" "/projects/protective-put/*"
 
       # MODE 2 — site hosted on an EC2 / Lightsail box (nginx, apache…)
       # Secrets needed: DEPLOY_MODE=ssh (variable), SSH_HOST, SSH_USER,
       #                 SSH_PRIVATE_KEY (a deploy key added to the server)
-      # Variable (optional): DEPLOY_PATH — defaults to /var/www/davidjia.ca
+      # Variable (optional): DEPLOY_PATH — defaults to the project subdirectory
       - name: Deploy via rsync over SSH
         if: vars.DEPLOY_MODE == 'ssh'
         run: |
+          DEPLOY_PATH="${{ vars.DEPLOY_PATH || '/var/www/davidjia.ca/projects/protective-put' }}"
+          case "$DEPLOY_PATH" in
+            */projects/protective-put) ;;
+            *) echo "DEPLOY_PATH must end in /projects/protective-put" >&2; exit 1 ;;
+          esac
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_deploy
           chmod 600 ~/.ssh/id_deploy
           ssh-keyscan -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
           rsync -avz --delete -e "ssh -i ~/.ssh/id_deploy" \
-            site/ "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${{ vars.DEPLOY_PATH || '/var/www/davidjia.ca' }}/"
+            site/ "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${DEPLOY_PATH}/"
+
