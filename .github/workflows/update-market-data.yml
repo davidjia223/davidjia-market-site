@@ -60,7 +60,7 @@ jobs:
         run: >
           aws cloudfront create-invalidation
           --distribution-id ${{ vars.CLOUDFRONT_ID }}
-          --paths "/data/market.json" "/index.html"
+          --paths "/" "/index.html" "/data/market.json"
 
       # MODE 2 — site hosted on an EC2 / Lightsail box (nginx, apache…)
       # Secrets needed: DEPLOY_MODE=ssh (variable), SSH_HOST, SSH_USER,
