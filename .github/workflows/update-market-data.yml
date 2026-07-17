@@ -1,0 +1,77 @@
+name: EOD market data update
+
+on:
+  schedule:
+    # 21:45 UTC, Mon-Fri = 5:45pm EDT / 4:45pm EST — after US market close.
+    # GitHub cron can run a few minutes late under load; harmless for EOD data.
+    - cron: "45 21 * * 1-5"
+  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  update-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch end-of-day market data
+        run: python fetch_market_data.py
+
+      - name: Commit updated data back to the repo
+        run: |
+          git config user.name "eod-market-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add site/data/market.json
+          git diff --cached --quiet || git commit -m "EOD market data $(date -u +%F)"
+          git push
+
+      # ---------------------------------------------------------------
+      # OPTIONAL DEPLOY TO AWS — pick ONE mode by setting the repository
+      # variable DEPLOY_MODE (Settings → Secrets and variables → Actions
+      # → Variables) to "s3" or "ssh". Leave it unset to skip deployment
+      # entirely: the site can read market.json straight from GitHub raw,
+      # so data still updates automatically with no AWS credentials here.
+      # ---------------------------------------------------------------
+
+      # MODE 1 — site hosted on S3 (+ optional CloudFront)
+      # Authentication uses GitHub OIDC and a least-privilege AWS role.
+      # Variables needed: DEPLOY_MODE=s3, AWS_REGION, S3_BUCKET,
+      #                   CLOUDFRONT_ID (optional)
+      - name: Configure AWS credentials
+        if: vars.DEPLOY_MODE == 's3'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::555545761964:role/GitHubActionsDeployDavidJiaMarketSite
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Sync site to S3
+        if: vars.DEPLOY_MODE == 's3'
+        run: aws s3 sync site/ s3://${{ vars.S3_BUCKET }} --delete
+
+      - name: Invalidate CloudFront cache
+        if: vars.DEPLOY_MODE == 's3' && vars.CLOUDFRONT_ID != ''
+        run: >
+          aws cloudfront create-invalidation
+          --distribution-id ${{ vars.CLOUDFRONT_ID }}
+          --paths "/data/market.json" "/index.html"
+
+      # MODE 2 — site hosted on an EC2 / Lightsail box (nginx, apache…)
+      # Secrets needed: DEPLOY_MODE=ssh (variable), SSH_HOST, SSH_USER,
+      #                 SSH_PRIVATE_KEY (a deploy key added to the server)
+      # Variable (optional): DEPLOY_PATH — defaults to /var/www/davidjia.ca
+      - name: Deploy via rsync over SSH
+        if: vars.DEPLOY_MODE == 'ssh'
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
+          rsync -avz --delete -e "ssh -i ~/.ssh/id_deploy" \
+            site/ "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${{ vars.DEPLOY_PATH || '/var/www/davidjia.ca' }}/"
