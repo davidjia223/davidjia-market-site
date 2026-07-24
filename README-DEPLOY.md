@@ -1,11 +1,11 @@
 # davidjia.ca — Protective Put Simulator with automatic EOD data
 
-Fully automatic, $0/month pipeline:
+Fully automatic pipeline:
 
 ```
-GitHub Actions (cron, Mon–Fri 21:45 UTC, after US close)
-   └─ fetch_market_data.py  → pulls from free, no-API-key sources:
-        SPY history ......... Stooq  (fallback: FRED SP500 ÷ 10)
+GitHub Actions (weekdays at 5:45pm Toronto, plus 8:30pm and 10:30pm retries)
+   └─ fetch_market_data.py  → pulls from:
+        SPY history ......... Tiingo EOD (sole fallback: FRED SP500 ÷ 10)
         VIX, VIX9D/3M/6M .... CBOE official CSVs (fallback: FRED VIXCLS)
         3-mo T-bill, 10Y .... FRED
    └─ commits site/data/market.json to this repo
@@ -27,9 +27,17 @@ Site (index.html) loads whichever copy of market.json is newest:
   `fetch_market_data.py`, `.github/workflows/update-market-data.yml`, `site/`.
 
 ### 2. Run the workflow once by hand
+Before running it, add these repository secrets under **Settings → Secrets
+and variables → Actions**:
+
+- `TIINGO_API_KEY` — the token from `tiingo.com/account/api/token`
+- `FRED_API_KEY` — the API key from FRED
+
 GitHub → your repo → **Actions** → "EOD market data update" → **Run workflow**.
 This generates the first `site/data/market.json`. After this it runs itself
-every weekday evening. (GitHub cron can start a few minutes late — harmless.)
+every weekday evening. If the first feed is stale, two later scheduled attempts
+retry automatically. Once current data is committed, later attempts do nothing.
+GitHub may still start an individual scheduled attempt later than its listed time.
 
 ### 3. Point the site at your repo
 In `site/index.html`, replace on the `GITHUB_RAW_DATA_URL` line:
@@ -98,9 +106,14 @@ cd site && python3 -m http.server 8000
 - **Weekends/holidays** show the last trading day's close — expected for EOD.
 - **Dividend yield** is a constant (`divYield` in `fetch_market_data.py`,
   currently 1.0%). Glance at it once or twice a year.
-- **Resilience:** every source has a fallback, and the site itself falls back
+- **Resilience:** every source has a fallback. The updater rejects stale price
+  data and gets two later attempts each weekday; the site itself also falls back
   gracefully with a visible label, so a broken feed never blanks the page.
-- **Cost:** $0. Public-repo Actions are free (this job uses ~1 min/day);
-  Stooq, CBOE, and FRED are free with no keys; you already pay for the server.
+- **Tiingo licensing:** Tiingo's Basic/free data may not be redistributed on a
+  public website. Use this integration only after Tiingo confirms that your
+  account permits this site's public display.
+- **Cost:** Public-repo Actions are free (these short attempts normally use
+  well under 3 minutes/day in total); API/data licensing depends on the account
+  permissions you obtain from Tiingo.
 - The Action commits a small JSON daily, so the repo history grows slowly —
   that's normal and harmless.

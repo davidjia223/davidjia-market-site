@@ -2,9 +2,14 @@ name: EOD market data update
 
 on:
   schedule:
-    # 21:45 UTC, Mon-Fri = 5:45pm EDT / 4:45pm EST — after US market close.
-    # GitHub cron can run a few minutes late under load; harmless for EOD data.
-    - cron: "45 21 * * 1-5"
+    # Initial attempt plus two later retries, all in Toronto local time.
+    # A retry becomes a no-op once the current market date is already committed.
+    - cron: "45 17 * * 1-5"
+      timezone: "America/Toronto"
+    - cron: "30 20 * * 1-5"
+      timezone: "America/Toronto"
+    - cron: "30 22 * * 1-5"
+      timezone: "America/Toronto"
   workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
 
 permissions:
@@ -22,9 +27,20 @@ jobs:
           python-version: "3.12"
 
       - name: Fetch end-of-day market data
-        run: python fetch_market_data.py
+        id: market
+        env:
+          TIINGO_API_KEY: ${{ secrets.TIINGO_API_KEY }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: |
+          python fetch_market_data.py
+          if git diff --quiet -- site/data/market.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Commit updated data back to the repo
+        if: steps.market.outputs.changed == 'true'
         run: |
           git config user.name "eod-market-bot"
           git config user.email "actions@users.noreply.github.com"
@@ -47,14 +63,14 @@ jobs:
       # Variables needed: DEPLOY_MODE=s3, AWS_REGION, S3_BUCKET,
       #                   CLOUDFRONT_ID (optional)
       - name: Configure AWS credentials
-        if: vars.DEPLOY_MODE == 's3'
+        if: steps.market.outputs.changed == 'true' && vars.DEPLOY_MODE == 's3'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::555545761964:role/GitHubActionsDeployDavidJiaMarketSite
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Sync simulator project to S3
-        if: vars.DEPLOY_MODE == 's3'
+        if: steps.market.outputs.changed == 'true' && vars.DEPLOY_MODE == 's3'
         run: |
           PROJECT_PREFIX="projects/protective-put"
           aws s3 sync site/ "s3://${{ vars.S3_BUCKET }}/${PROJECT_PREFIX}/" \
@@ -69,7 +85,7 @@ jobs:
             --only-show-errors
 
       - name: Invalidate CloudFront cache
-        if: vars.DEPLOY_MODE == 's3' && vars.CLOUDFRONT_ID != ''
+        if: steps.market.outputs.changed == 'true' && vars.DEPLOY_MODE == 's3' && vars.CLOUDFRONT_ID != ''
         run: >
           aws cloudfront create-invalidation
           --distribution-id ${{ vars.CLOUDFRONT_ID }}
@@ -80,7 +96,7 @@ jobs:
       #                 SSH_PRIVATE_KEY (a deploy key added to the server)
       # Variable (optional): DEPLOY_PATH — defaults to the project subdirectory
       - name: Deploy via rsync over SSH
-        if: vars.DEPLOY_MODE == 'ssh'
+        if: steps.market.outputs.changed == 'true' && vars.DEPLOY_MODE == 'ssh'
         run: |
           DEPLOY_PATH="${{ vars.DEPLOY_PATH || '/var/www/davidjia.ca/projects/protective-put' }}"
           case "$DEPLOY_PATH" in
@@ -93,4 +109,3 @@ jobs:
           ssh-keyscan -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
           rsync -avz --delete -e "ssh -i ~/.ssh/id_deploy" \
             site/ "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${DEPLOY_PATH}/"
-

@@ -2,61 +2,177 @@
 """
 fetch_market_data.py — end-of-day market data updater for davidjia.ca
 Runs on GitHub Actions after US market close. Uses only Python stdlib
-(no pip installs) and only free, no-API-key public data sources:
+(no pip installs). API credentials are supplied through GitHub Actions secrets:
 
-  SPY daily history .... Stooq        https://stooq.com/q/d/l/?s=spy.us&i=d
-  S&P 500 fallback ..... FRED SP500   https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500
+  SPY daily history .... Tiingo EOD   https://api.tiingo.com/tiingo/daily/SPY/prices
+  S&P 500 fallback ..... FRED SP500   https://api.stlouisfed.org/fred/series/observations
   VIX / 9D / 3M / 6M ... CBOE CDN     https://cdn.cboe.com/api/global/us_indices/daily_prices/
   VIX fallback ......... FRED VIXCLS
   3-mo T-bill (r) ...... FRED DTB3
   10-yr Treasury ....... FRED DGS10
 
 Writes: site/data/market.json
-Exit code is non-zero only if the core price series cannot be fetched.
+Exit code is non-zero if the core price series cannot be fetched or is stale.
 """
 
 import csv
 import io
 import json
+import os
 import sys
+import urllib.error
+import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 OUT = Path(__file__).parent / "site" / "data" / "market.json"
 UA = {"User-Agent": "Mozilla/5.0 (davidjia.ca EOD data bot; contact: site owner)"}
 HISTORY_DAYS = 260  # ~1 trading year kept for the chart
+MARKET_TZ = ZoneInfo("America/New_York")
 
 
-def get(url, timeout=30):
-    req = urllib.request.Request(url, headers=UA)
+def get(url, timeout=30, headers=None):
+    request_headers = dict(UA)
+    if headers:
+        request_headers.update(headers)
+    req = urllib.request.Request(url, headers=request_headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode("utf-8", errors="replace")
+
+
+def get_json(url, timeout=30, headers=None):
+    return json.loads(get(url, timeout=timeout, headers=headers))
 
 
 def read_csv(text):
     return list(csv.reader(io.StringIO(text)))
 
 
-# ---------------------------------------------------------------- SPY
-def fetch_spy():
-    """Return (price, [[date, close], ...]) — Stooq first, FRED SP500/10 fallback."""
-    try:
-        rows = read_csv(get("https://stooq.com/q/d/l/?s=spy.us&i=d"))
-        data = [(r[0], float(r[4])) for r in rows[1:] if len(r) >= 5 and r[4]]
-        if len(data) < 30:
-            raise ValueError("Stooq returned too few rows")
-        data = data[-HISTORY_DAYS:]
-        print(f"  SPY via Stooq: {len(data)} rows, last {data[-1]}")
-        return data[-1][1], [[d, c] for d, c in data], "stooq"
-    except Exception as e:
-        print(f"  Stooq failed ({e}); falling back to FRED SP500 / 10")
+def expected_market_date(now=None):
+    """Return the latest expected weekday in the US market timezone."""
+    market_now = now.astimezone(MARKET_TZ) if now else datetime.now(MARKET_TZ)
+    day = market_now.date()
+    while day.weekday() >= 5:
+        day -= timedelta(days=1)
+    return day
 
-    rows = read_csv(get("https://fred.stlouisfed.org/graph/fredgraph.csv?id=SP500"))
+
+def existing_market_date():
+    """Return the currently committed market date, if it can be read."""
+    try:
+        payload = json.loads(OUT.read_text())
+        return date.fromisoformat(payload["asOf"])
+    except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def describe_request_error(exc):
+    """Describe a provider error without exposing a credential-bearing URL."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"HTTP {exc.code}"
+    if isinstance(exc, (RuntimeError, ValueError)):
+        return str(exc)
+    return type(exc).__name__
+
+
+def fred_observations(series, *, observation_start=None, limit=100000, sort_order="asc"):
+    """Return non-missing (date, value) observations from the official FRED API."""
+    api_key = os.environ.get("FRED_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("FRED_API_KEY is not set")
+
+    params = {
+        "series_id": series,
+        "api_key": api_key,
+        "file_type": "json",
+        "limit": str(limit),
+        "sort_order": sort_order,
+    }
+    if observation_start is not None:
+        params["observation_start"] = observation_start.isoformat()
+
+    url = (
+        "https://api.stlouisfed.org/fred/series/observations?"
+        + urllib.parse.urlencode(params)
+    )
+    try:
+        payload = get_json(url)
+    except Exception as exc:
+        raise RuntimeError(
+            f"FRED {series} request failed ({describe_request_error(exc)})"
+        ) from None
+
+    observations = payload.get("observations")
+    if not isinstance(observations, list):
+        raise ValueError(f"FRED {series} returned an invalid response")
+
+    return [
+        (row["date"], float(row["value"]))
+        for row in observations
+        if row.get("date") and row.get("value") not in (None, "", ".")
+    ]
+
+
+# ---------------------------------------------------------------- SPY
+def fetch_spy_tiingo(target_date):
+    """Return Tiingo SPY closes through target_date."""
+    api_key = os.environ.get("TIINGO_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("TIINGO_API_KEY is not set")
+
+    params = {
+        "startDate": (target_date - timedelta(days=HISTORY_DAYS * 2)).isoformat(),
+        "endDate": target_date.isoformat(),
+        "format": "json",
+        "resampleFreq": "daily",
+    }
+    url = (
+        "https://api.tiingo.com/tiingo/daily/SPY/prices?"
+        + urllib.parse.urlencode(params)
+    )
+    payload = get_json(
+        url,
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Token {api_key}",
+        },
+    )
+    if not isinstance(payload, list):
+        raise ValueError("Tiingo returned an invalid response")
+
+    data = sorted(
+        [
+            (str(row.get("date", ""))[:10], float(row["close"]))
+            for row in payload
+            if row.get("date") and row.get("close") is not None
+        ],
+        key=lambda item: item[0],
+    )[-HISTORY_DAYS:]
+    if len(data) < 30:
+        raise ValueError("Tiingo returned too few SPY rows")
+    return data
+
+
+def fetch_spy(target_date):
+    """Return (price, [[date, close], ...]) — Tiingo first, FRED as sole fallback."""
+    try:
+        data = fetch_spy_tiingo(target_date)
+        print(f"  SPY via Tiingo: {len(data)} rows, last {data[-1]}")
+        return data[-1][1], [[d, c] for d, c in data], "tiingo"
+    except Exception as exc:
+        print(
+            f"  Tiingo failed ({describe_request_error(exc)}); "
+            "falling back to FRED SP500 / 10"
+        )
+
     data = [
-        (r[0], round(float(r[1]) / 10.0, 2))
-        for r in rows[1:]
-        if len(r) >= 2 and r[1] not in (".", "")
+        (d, round(value / 10.0, 2))
+        for d, value in fred_observations(
+            "SP500",
+            observation_start=target_date - timedelta(days=HISTORY_DAYS * 2),
+        )
     ][-HISTORY_DAYS:]
     if len(data) < 30:
         raise ValueError("FRED SP500 fallback also failed")
@@ -88,9 +204,8 @@ def fetch_vix_family():
             print(f"  {sym} unavailable ({e})")
     if out["spot"] is None:  # FRED fallback for headline VIX
         try:
-            rows = read_csv(get("https://fred.stlouisfed.org/graph/fredgraph.csv?id=VIXCLS"))
-            vals = [r for r in rows[1:] if len(r) >= 2 and r[1] not in (".", "")]
-            out["spot"] = round(float(vals[-1][1]), 2)
+            vals = fred_observations("VIXCLS", limit=10, sort_order="desc")
+            out["spot"] = round(vals[0][1], 2)
             print(f"  VIX via FRED VIXCLS: {out['spot']}")
         except Exception as e:
             print(f"  FRED VIXCLS fallback failed ({e})")
@@ -99,14 +214,29 @@ def fetch_vix_family():
 
 # ---------------------------------------------------------------- rates
 def fred_latest(series):
-    rows = read_csv(get(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}"))
-    vals = [r for r in rows[1:] if len(r) >= 2 and r[1] not in (".", "")]
-    return round(float(vals[-1][1]), 3)
+    vals = fred_observations(series, limit=10, sort_order="desc")
+    if not vals:
+        raise ValueError(f"FRED {series} returned no observations")
+    return round(vals[0][1], 3)
 
 
 def main():
     print("Fetching end-of-day market data…")
-    price, history, spy_source = fetch_spy()  # raises on total failure — that's intended
+    target_date = expected_market_date()
+    current_date = existing_market_date()
+
+    if current_date is not None and current_date >= target_date:
+        print(f"Market data is already current through {current_date}; nothing to update")
+        return
+
+    price, history, spy_source = fetch_spy(target_date)  # raises on total failure
+    fetched_date = date.fromisoformat(history[-1][0])
+    if fetched_date < target_date:
+        raise RuntimeError(
+            f"Price data is stale: source returned {fetched_date}, expected {target_date}. "
+            "A later scheduled retry will try again."
+        )
+
     vix, vix_date = fetch_vix_family()
 
     rates = {}
