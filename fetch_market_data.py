@@ -81,7 +81,26 @@ def fred_observations(series, *, observation_start=None, limit=100000, sort_orde
     """Return non-missing (date, value) observations from the official FRED API."""
     api_key = os.environ.get("FRED_API_KEY", "").strip()
     if not api_key:
-        raise RuntimeError("FRED_API_KEY is not set")
+        rows = read_csv(
+            get(
+                "https://fred.stlouisfed.org/graph/fredgraph.csv?"
+                + urllib.parse.urlencode({"id": series})
+            )
+        )
+        observations = [
+            (row[0], float(row[1]))
+            for row in rows[1:]
+            if len(row) >= 2
+            and row[1] not in ("", ".")
+            and (
+                observation_start is None
+                or date.fromisoformat(row[0]) >= observation_start
+            )
+        ]
+        if sort_order == "desc":
+            observations.reverse()
+        print(f"  FRED {series} via no-key CSV fallback")
+        return observations[:limit]
 
     params = {
         "series_id": series,

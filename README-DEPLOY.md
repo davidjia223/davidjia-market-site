@@ -31,7 +31,8 @@ Before running it, add these repository secrets under **Settings → Secrets
 and variables → Actions**:
 
 - `TIINGO_API_KEY` — the token from `tiingo.com/account/api/token`
-- `FRED_API_KEY` — the API key from FRED
+- `FRED_API_KEY` — the API key from FRED (recommended; the updater can use
+  FRED's official no-key CSV endpoint when this secret is absent)
 
 GitHub → your repo → **Actions** → "EOD market data update" → **Run workflow**.
 This generates the first `site/data/market.json`. After this it runs itself
